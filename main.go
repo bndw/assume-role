@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"runtime"
@@ -12,19 +11,19 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sts"
-	"gopkg.in/yaml.v2"
 )
-
-var configFilePath = fmt.Sprintf("%s/.aws/roles", os.Getenv("HOME"))
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "Usage: %s <role> [<command> <args...>]\n", os.Args[0])
 	flag.PrintDefaults()
+}
+
+type Assumable struct {
+	Credentials *credentials.Value
+	Region      *string
 }
 
 func init() {
@@ -55,49 +54,23 @@ func main() {
 		os.Exit(1)
 	}
 
-
 	stscreds.DefaultDuration = *duration
 
 	role := argv[0]
 	args := argv[1:]
 
-	// Load credentials from configFilePath if it exists, else use regular AWS config
-	var creds *credentials.Value
-	if _, err := os.Stat(configFilePath); err == nil {
-		fmt.Fprintf(os.Stderr, "WARNING: using deprecated role file (%s), switch to config file"+
-			" (https://docs.aws.amazon.com/cli/latest/userguide/cli-roles.html)\n",
-			configFilePath)
-		config, err := loadConfig()
-		must(err)
-
-		roleConfig, ok := config[role]
-		if !ok {
-			must(fmt.Errorf("%s not in ~/.aws/roles", role))
-		}
-
-		if os.Getenv("ASSUMED_ROLE") != "" {
-			// Clear out any previously set AWS_ environment variables so
-			// they aren't used by this call
-			cleanEnv()
-		}
-
-		creds, err = assumeRole(roleConfig.Role, roleConfig.MFA, *duration)
-		must(err)
-
-	} else {
-		if os.Getenv("ASSUMED_ROLE") != "" {
-			cleanEnv()
-		}
-		creds, err = assumeProfile(role)
-		must(err)
+	if os.Getenv("ASSUMED_ROLE") != "" {
+		cleanEnv()
 	}
+	assume, err := assumeProfile(role)
+	must(err)
 
 	if len(args) == 0 {
 		switch *format {
 		case "powershell":
-			printPowerShellCredentials(role, creds)
+			printPowerShellCredentials(role, assume)
 		case "bash":
-			printCredentials(role, creds)
+			printCredentials(role, assume)
 		default:
 			flag.Usage()
 			os.Exit(1)
@@ -105,8 +78,7 @@ func main() {
 		return
 	}
 
-	err := execWithCredentials(args, creds)
-	must(err)
+	must(exportVariables(args, assume))
 }
 
 func cleanEnv() {
@@ -116,16 +88,17 @@ func cleanEnv() {
 	os.Unsetenv("AWS_SECURITY_TOKEN")
 }
 
-func execWithCredentials(argv []string, creds *credentials.Value) error {
+func exportVariables(argv []string, assume *Assumable) error {
 	argv0, err := exec.LookPath(argv[0])
 	if err != nil {
 		return err
 	}
 
-	os.Setenv("AWS_ACCESS_KEY_ID", creds.AccessKeyID)
-	os.Setenv("AWS_SECRET_ACCESS_KEY", creds.SecretAccessKey)
-	os.Setenv("AWS_SESSION_TOKEN", creds.SessionToken)
-	os.Setenv("AWS_SECURITY_TOKEN", creds.SessionToken)
+	os.Setenv("AWS_ACCESS_KEY_ID", assume.Credentials.AccessKeyID)
+	os.Setenv("AWS_SECRET_ACCESS_KEY", assume.Credentials.SecretAccessKey)
+	os.Setenv("AWS_SESSION_TOKEN", assume.Credentials.SessionToken)
+	os.Setenv("AWS_SECURITY_TOKEN", assume.Credentials.SessionToken)
+	os.Setenv("AWS_REGION", *assume.Region)
 
 	env := os.Environ()
 	return syscall.Exec(argv0, argv, env)
@@ -133,11 +106,12 @@ func execWithCredentials(argv []string, creds *credentials.Value) error {
 
 // printCredentials prints the credentials in a way that can easily be sourced
 // with bash.
-func printCredentials(role string, creds *credentials.Value) {
-	fmt.Printf("export AWS_ACCESS_KEY_ID=\"%s\"\n", creds.AccessKeyID)
-	fmt.Printf("export AWS_SECRET_ACCESS_KEY=\"%s\"\n", creds.SecretAccessKey)
-	fmt.Printf("export AWS_SESSION_TOKEN=\"%s\"\n", creds.SessionToken)
-	fmt.Printf("export AWS_SECURITY_TOKEN=\"%s\"\n", creds.SessionToken)
+func printCredentials(role string, assume *Assumable) {
+	fmt.Printf("export AWS_ACCESS_KEY_ID=\"%s\"\n", assume.Credentials.AccessKeyID)
+	fmt.Printf("export AWS_SECRET_ACCESS_KEY=\"%s\"\n", assume.Credentials.SecretAccessKey)
+	fmt.Printf("export AWS_SESSION_TOKEN=\"%s\"\n", assume.Credentials.SessionToken)
+	fmt.Printf("export AWS_SECURITY_TOKEN=\"%s\"\n", assume.Credentials.SessionToken)
+	fmt.Printf("export AWS_REGION=\"%s\"\n", *assume.Region)
 	fmt.Printf("export ASSUMED_ROLE=\"%s\"\n", role)
 	fmt.Printf("# Run this to configure your shell:\n")
 	fmt.Printf("# eval $(%s)\n", strings.Join(os.Args, " "))
@@ -145,11 +119,12 @@ func printCredentials(role string, creds *credentials.Value) {
 
 // printPowerShellCredentials prints the credentials in a way that can easily be sourced
 // with Windows powershell using Invoke-Expression.
-func printPowerShellCredentials(role string, creds *credentials.Value) {
-	fmt.Printf("$env:AWS_ACCESS_KEY_ID=\"%s\"\n", creds.AccessKeyID)
-	fmt.Printf("$env:AWS_SECRET_ACCESS_KEY=\"%s\"\n", creds.SecretAccessKey)
-	fmt.Printf("$env:AWS_SESSION_TOKEN=\"%s\"\n", creds.SessionToken)
-	fmt.Printf("$env:AWS_SECURITY_TOKEN=\"%s\"\n", creds.SessionToken)
+func printPowerShellCredentials(role string, assume *Assumable) {
+	fmt.Printf("$env:AWS_ACCESS_KEY_ID=\"%s\"\n", assume.Credentials.AccessKeyID)
+	fmt.Printf("$env:AWS_SECRET_ACCESS_KEY=\"%s\"\n", assume.Credentials.SecretAccessKey)
+	fmt.Printf("$env:AWS_SESSION_TOKEN=\"%s\"\n", assume.Credentials.SessionToken)
+	fmt.Printf("$env:AWS_SECURITY_TOKEN=\"%s\"\n", assume.Credentials.SessionToken)
+	fmt.Printf("$env:AWS_REGION=\"%s\"\n", *assume.Region)
 	fmt.Printf("$env:ASSUMED_ROLE=\"%s\"\n", role)
 	fmt.Printf("# Run this to configure your shell:\n")
 	fmt.Printf("# %s | Invoke-Expression \n", strings.Join(os.Args, " "))
@@ -158,7 +133,7 @@ func printPowerShellCredentials(role string, creds *credentials.Value) {
 // assumeProfile assumes the named profile which must exist in ~/.aws/config
 // (https://docs.aws.amazon.com/cli/latest/userguide/cli-roles.html) and returns the temporary STS
 // credentials.
-func assumeProfile(profile string) (*credentials.Value, error) {
+func assumeProfile(profile string) (*Assumable, error) {
 	sess := session.Must(session.NewSessionWithOptions(session.Options{
 		Profile:                 profile,
 		SharedConfigState:       session.SharedConfigEnable,
@@ -169,49 +144,11 @@ func assumeProfile(profile string) (*credentials.Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &creds, nil
+	return &Assumable{
+		Credentials: &creds,
+		Region:      sess.Config.Region,
+	}, nil
 }
-
-// assumeRole assumes the given role and returns the temporary STS credentials.
-func assumeRole(role, mfa string, duration time.Duration) (*credentials.Value, error) {
-	sess := session.Must(session.NewSession())
-
-	svc := sts.New(sess)
-
-	params := &sts.AssumeRoleInput{
-		RoleArn:         aws.String(role),
-		RoleSessionName: aws.String("cli"),
-		DurationSeconds: aws.Int64(int64(duration / time.Second)),
-	}
-	if mfa != "" {
-		params.SerialNumber = aws.String(mfa)
-		token, err := readTokenCode()
-		if err != nil {
-			return nil, err
-		}
-		params.TokenCode = aws.String(token)
-	}
-
-	resp, err := svc.AssumeRole(params)
-
-	if err != nil {
-		return nil, err
-	}
-
-	var creds credentials.Value
-	creds.AccessKeyID = *resp.Credentials.AccessKeyId
-	creds.SecretAccessKey = *resp.Credentials.SecretAccessKey
-	creds.SessionToken = *resp.Credentials.SessionToken
-
-	return &creds, nil
-}
-
-type roleConfig struct {
-	Role string `yaml:"role"`
-	MFA  string `yaml:"mfa"`
-}
-
-type config map[string]roleConfig
 
 // readTokenCode reads the MFA token from Stdin.
 func readTokenCode() (string, error) {
@@ -222,17 +159,6 @@ func readTokenCode() (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(text), nil
-}
-
-// loadConfig loads the ~/.aws/roles file.
-func loadConfig() (config, error) {
-	raw, err := ioutil.ReadFile(configFilePath)
-	if err != nil {
-		return nil, err
-	}
-
-	roleConfig := make(config)
-	return roleConfig, yaml.Unmarshal(raw, &roleConfig)
 }
 
 func must(err error) {
